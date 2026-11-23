@@ -1,3 +1,15 @@
+## Desktop GUI
+
+This fork adds a native `tkinter` desktop GUI for photos, videos, and batch folders with side-by-side / split-slider preview, hover metric depth inspection, live colormap switching, and CUDA VRAM monitoring.
+
+Run from the main directory using
+
+```bash
+uv run depth-pro-2 gui
+```
+
+**See [GUI.md](GUI.md) for the full parameter guide, example 16 GB GPU video presets, and Windows CUDA setup notes.**
+
 <h1 align="center">Depth Pro 2: Sharp and Temporally Consistent Metric Monocular Depth</h1>
 
 <p align="center">

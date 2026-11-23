@@ -21,6 +21,7 @@ coreml = ["coremltools==9.0"]
 
 [project.scripts]
 depth-pro-2 = "depth_pro_2.cli:main_cli"
+depth-pro-2-gui = "depth_pro_2.gui:main_gui"
 
 [build-system]
 requires = ["setuptools"]
@@ -38,3 +39,16 @@ target-version = "py311"
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu132", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu132", marker = "sys_platform == 'win32'" },
+]

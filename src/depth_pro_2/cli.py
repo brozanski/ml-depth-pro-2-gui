@@ -48,6 +48,14 @@ def main_cli():
     """Run Depth Pro 2 inference."""
 
 
+@main_cli.command("gui")
+def gui_cli():
+    """Launch the desktop GUI for Depth Pro 2."""
+    from .gui import main_gui
+
+    main_gui()
+
+
 @main_cli.command("predict")
 @click.option(
     "-i",
