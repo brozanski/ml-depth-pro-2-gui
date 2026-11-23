@@ -7,7 +7,8 @@ This fork adds a native desktop GUI built with Python's built-in `tkinter` / `tt
 - **Photos, Videos, and Folders**: Load a single image, preview frame 0 of a video, or batch-process an entire folder.
 - **Interactive Preview**: Compare results in **Side-by-Side**, draggable **Split Slider**, **Depth Only**, or **Input Only** views.
 - **Metric Hover Inspector**: Move your pointer over any preview image to read exact pixel coordinates `(x, y)` and depth in meters (`∞ (far / sky)` for infinite depth).
-- **Live Colormap Switching & Re-export**: Switch between `turbo`, `inferno`, `magma`, `plasma`, `viridis`, and `gray` instantaneously without re-running inference, then click **Re-export Outputs** to save updated color PNGs/MP4s or 16-bit PNGs.
+- **Live Colormap Switching & Re-export**: Switch between `turbo`, `inferno`, `magma`, `plasma`, `viridis`, and `gray` instantaneously without re-running inference, then click **Re-export Outputs** to save updated color PNGs/MP4s or 16-bit PNGs (with optional `-<model>` and `-<colormap>` filename tags).
+- **Persistent Settings**: All selected GUI options, view mode, split slider position, and window size are automatically saved and restored on restart.
 - **Live Progress & Console Logging**: Displays stage timers while loading/running clip 1 and real-time frame count, percentage, FPS, ETA, and CUDA VRAM usage in both the GUI and terminal console.
 - **Model Caching & Memory Control**: Keeps the loaded model cached across runs for fast iteration, with **Unload Model** to free VRAM/RAM and **Cancel** to stop long video jobs cleanly.
 - **Built-in Parameter Help**: Hover over any setting for a tooltip or click **? Help** in the toolbar to open the in-app Parameter Guide.
@@ -61,12 +62,15 @@ uv run depth-pro-2-gui
 | Setting | What it does |
 |---|---|
 | **Colormap** | Color palette (`turbo` default, `inferno`, `magma`, `plasma`, `viridis`, `gray`) used for previews and saved color depth maps. Updates the preview immediately without re-running the model. |
-| **Append colormap to filename** | Appends `-<colormap>` to saved color PNG/MP4 filenames (for example `example-depth-inferno.png` or `example-depth-magma.mp4`) so you can export multiple colormaps without overwriting earlier files. |
+| **Append colormap** | Appends `-<colormap>` to saved color PNG/MP4 filenames (for example `example-depth-inferno.png` or `example-depth-magma.mp4`) so you can export multiple colormaps without overwriting earlier files. |
+| **Append model** | Appends `-<model>` (for example `-depthpro2-h`) to color PNG/MP4 (`example-depth-depthpro2-h.png`), 16-bit PNG (`example-depth16-depthpro2-h.png`), and `.npz` (`example-depth-depthpro2-h.npz`) outputs—combining cleanly with **Append colormap** (`example-depth-depthpro2-h-inferno.png`). Re-export uses the model variant that produced the cached depth. |
 | **Save 16-bit PNG (`--save-png16`)** | Also saves 16-bit grayscale inverse depth PNGs (`white = near`, `black = infinitely far`) for compositing tools like Nuke or Blender. The log prints the meter conversion formula. |
 | **Save metric depth `.npz` (`--save-npz`)** | Also writes raw float32 `depth` (in meters) and `focallength_px` arrays. Note: videos write one `.npz` file per frame, which can consume large amounts of disk space. |
-| **Re-export Outputs** | After depth estimation finishes, change **Colormap**, **Append colormap to filename**, **Save 16-bit PNG**, or **Output folder** and click **Re-export Outputs** to regenerate the saved PNG or MP4 without re-running the neural network. Videos are cached temporarily up to 2 GiB (exact per-frame video `.npz` export requires enabling **Save metric depth `.npz`** before running). |
+| **Re-export Outputs** | After depth estimation finishes, change **Colormap**, **Append colormap**, **Append model**, **Save 16-bit PNG**, or **Output folder** and click **Re-export Outputs** to regenerate the saved PNG or MP4 without re-running the neural network. Videos are cached temporarily up to 2 GiB (exact per-frame video `.npz` export requires enabling **Save metric depth `.npz`** before running). |
 
 > **Existing File Prompt:** Whenever an export or re-export target filename already exists in the output folder, the GUI asks whether to **Overwrite**, **Rename** (enter a custom base name or use auto-numbering, with **Auto-Rename** for batch folders), **Add Date & Time** (`_YYYYMMDD-HHMMSS`), or **Cancel**.
+
+> **Saved Settings:** All GUI options, view mode, split position, and window size are automatically saved to `gui_settings.json` in your OS config folder (`%APPDATA%\depth-pro-2\` on Windows, `~/Library/Application Support/depth-pro-2/` on macOS, `~/.config/depth-pro-2/` on Linux) and restored when you reopen the app.
 
 ---
 

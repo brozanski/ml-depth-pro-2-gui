@@ -10,6 +10,7 @@ import ctypes
 import datetime
 import gc
 import itertools
+import json
 import logging
 import math
 import os
@@ -53,6 +54,9 @@ VIDEO_RES_OPTIONS: tuple[tuple[int | None, str], ...] = (
 VIDEO_RES_LABEL_TO_PX: dict[str, int | None] = {
     label: px for px, label in VIDEO_RES_OPTIONS
 }
+VIDEO_RES_PX_TO_LABEL: dict[int | None, str] = {
+    px: label for px, label in VIDEO_RES_OPTIONS
+}
 COLORMAP_CHOICES: tuple[str, ...] = ("turbo", "inferno", "magma", "plasma", "viridis", "gray")
 VIEW_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("side", "Side-by-Side"),
@@ -60,6 +64,7 @@ VIEW_MODE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("depth", "Depth Only"),
     ("input", "Input Only"),
 )
+VIEW_MODE_KEYS: frozenset[str] = frozenset(key for key, _ in VIEW_MODE_OPTIONS)
 
 VIDEO_EXTENSIONS: tuple[str, ...] = (
     ".mov",
@@ -78,6 +83,7 @@ VIDEO_FILE_PATTERNS = "*.mp4 *.mov *.m4v *.avi *.mkv *.webm *.mpg *.mpeg *.mts"
 PREVIEW_MAX_SIDE = 1280
 POLL_INTERVAL_MS = 50
 RESIZE_DEBOUNCE_MS = 30
+SETTINGS_SAVE_DEBOUNCE_MS = 250
 VIDEO_UI_THROTTLE_S = 0.15
 CONSOLE_PROGRESS_INTERVAL_S = 2.0
 CONSOLE_PROGRESS_STEP_PCT = 5.0
@@ -149,6 +155,12 @@ TOOLTIP_TEXTS: dict[str, str] = {
         "Include the selected colormap name in color output filenames (e.g. "
         "example-depth-inferno.png) so multiple colormaps don't overwrite each other."
     ),
+    "append_model": (
+        "Include the model variant in output filenames (e.g. "
+        "example-depth-depthpro2-h.png, example-depth16-depthpro2-h.png, "
+        "example-depth-depthpro2-h.npz) so outputs from different models don't "
+        "overwrite each other."
+    ),
     "save_png16": (
         "Also save 16-bit grayscale inverse depth PNGs (white = near, black = far) for Nuke, "
         "Blender, or compositing."
@@ -158,8 +170,9 @@ TOOLTIP_TEXTS: dict[str, str] = {
         "for videos, writes one large file per frame."
     ),
     "reexport": (
-        "Re-save the last estimated image or video using the current Colormap, Save options, "
-        "and Output folder without re-running the neural network."
+        "Re-save the last estimated image or video using the current Colormap, filename "
+        "suffix options (Append colormap, Append model), Save options, and Output folder "
+        "without re-running the neural network."
     ),
 }
 
@@ -243,9 +256,15 @@ PARAMETER_GUIDE_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = 
                 "(turbo is the CLI default). Changing this updates the preview live.",
             ),
             (
-                "Append colormap to filename",
+                "Append colormap",
                 "Adds -<colormap> to colorized output filenames (e.g. photo-depth-inferno.png "
                 "or video-depth-magma.mp4) so exporting different palettes keeps each file.",
+            ),
+            (
+                "Append model",
+                "Adds -<model> (e.g. -depthpro2-h) to color PNG/MP4, 16-bit PNG, and .npz "
+                "outputs so runs with different model variants don't overwrite each other. "
+                "Re-export uses the model variant that produced the cached depth.",
             ),
             (
                 "Save 16-bit PNG (--save-png16)",
@@ -260,11 +279,12 @@ PARAMETER_GUIDE_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = 
             (
                 "Re-export Outputs & Overwrite Prompt",
                 "After depth estimation finishes, you can change Colormap, Append colormap, "
-                "Save 16-bit PNG, or Output folder and click Re-export Outputs to regenerate the "
-                "saved PNG or MP4 without re-running the model (cached up to 2 GiB for videos; "
-                "video .npz re-export requires enabling Save metric depth .npz before running). "
-                "When an output filename already exists, a prompt asks whether to Overwrite, "
-                "Rename (custom or auto-numbered), Add Date & Time, or Cancel.",
+                "Append model, Save 16-bit PNG, or Output folder and click Re-export Outputs to "
+                "regenerate the saved PNG or MP4 without re-running the model (cached up to "
+                "2 GiB for videos; video .npz re-export requires enabling Save metric depth "
+                ".npz before running). When an output filename already exists, a prompt asks "
+                "whether to Overwrite, Rename (custom or auto-numbered), Add Date & Time, "
+                "or Cancel.",
             ),
         ),
     ),
@@ -280,6 +300,12 @@ PARAMETER_GUIDE_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = 
                 "Hover Inspection",
                 "Move your mouse over any displayed input or depth image to read exact pixel "
                 "coordinates and metric depth in meters at the bottom bar.",
+            ),
+            (
+                "Saved Settings",
+                "All sidebar options, view mode, split position, and window size are "
+                "automatically saved to the user config directory (gui_settings.json) and "
+                "restored on restart.",
             ),
             (
                 "VRAM & Speed Tips (16 GB GPUs)",
@@ -311,6 +337,7 @@ class RunConfig:
     save_npz: bool
     max_short_side: int | None = None
     append_colormap: bool = False
+    append_model: bool = False
     conflict_policy: str = "overwrite"
     custom_stem: str | None = None
 
@@ -345,6 +372,7 @@ class _ExportState:
     p05: float | None
     p95: float | None
     inf_pct: float
+    model: str = DEFAULT_MODEL_KEY
     inverse_depth: np.ndarray | None = None
     frame_shape: tuple[int, int] | None = None
     frame_count: int = 0
@@ -668,6 +696,56 @@ def format_timestamp_suffix(now: datetime.datetime | None = None) -> str:
     return (now or datetime.datetime.now()).strftime("_%Y%m%d-%H%M%S")
 
 
+def default_settings_path() -> Path:
+    """Return the cross-platform user config file path for persisted GUI settings."""
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "").strip()
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "depth-pro-2" / "gui_settings.json"
+
+
+def load_gui_settings(path: Path) -> dict[str, Any]:
+    """Load persisted GUI settings from JSON, returning ``{}`` if missing or invalid."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_gui_settings(path: Path, data: dict[str, Any]) -> bool:
+    """Atomically persist GUI settings to ``path`` as UTF-8 JSON without raising."""
+    tmp_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".gui_settings_",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+        return True
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return False
+
+
 def build_output_paths(
     output_dir: Path,
     stem: str,
@@ -675,19 +753,22 @@ def build_output_paths(
     is_video: bool,
     colormap: str,
     append_colormap: bool,
+    model: str = "",
+    append_model: bool = False,
     save_png16: bool,
     save_npz: bool,
 ) -> _OutputTargets:
     """Compute output file/directory paths for an image or video export."""
+    model_tag = f"-{model}" if (append_model and model) else ""
     cmap_tag = f"-{colormap}" if append_colormap else ""
     if is_video:
-        color_path = output_dir / f"{stem}-depth{cmap_tag}.mp4"
-        png16_path = output_dir / f"{stem}-depth16" if save_png16 else None
-        npz_path = output_dir / f"{stem}-depth" if save_npz else None
+        color_path = output_dir / f"{stem}-depth{model_tag}{cmap_tag}.mp4"
+        png16_path = output_dir / f"{stem}-depth16{model_tag}" if save_png16 else None
+        npz_path = output_dir / f"{stem}-depth{model_tag}" if save_npz else None
     else:
-        color_path = output_dir / f"{stem}-depth{cmap_tag}.png"
-        png16_path = output_dir / f"{stem}-depth16.png" if save_png16 else None
-        npz_path = output_dir / f"{stem}-depth.npz" if save_npz else None
+        color_path = output_dir / f"{stem}-depth{model_tag}{cmap_tag}.png"
+        png16_path = output_dir / f"{stem}-depth16{model_tag}.png" if save_png16 else None
+        npz_path = output_dir / f"{stem}-depth{model_tag}.npz" if save_npz else None
     return _OutputTargets(color_path=color_path, png16_path=png16_path, npz_path=npz_path)
 
 
@@ -714,6 +795,8 @@ def next_available_stem(
     is_video: bool,
     colormap: str,
     append_colormap: bool,
+    model: str = "",
+    append_model: bool = False,
     save_png16: bool,
     save_npz: bool,
     base_suffix: str = "",
@@ -728,6 +811,8 @@ def next_available_stem(
             is_video=is_video,
             colormap=colormap,
             append_colormap=append_colormap,
+            model=model,
+            append_model=append_model,
             save_png16=save_png16,
             save_npz=save_npz,
         )
@@ -742,6 +827,8 @@ def next_available_stem(
             is_video=is_video,
             colormap=colormap,
             append_colormap=append_colormap,
+            model=model,
+            append_model=append_model,
             save_png16=save_png16,
             save_npz=save_npz,
         )
@@ -758,6 +845,7 @@ def reexport_image(
     save_npz: bool,
     *,
     append_colormap: bool = False,
+    append_model: bool = False,
     export_stem: str | None = None,
 ) -> tuple[Path, list[str], np.ndarray]:
     """Re-export cached image depth with updated colormap and output options."""
@@ -774,6 +862,8 @@ def reexport_image(
         is_video=False,
         colormap=colormap,
         append_colormap=append_colormap,
+        model=state.model,
+        append_model=append_model,
         save_png16=save_png16,
         save_npz=save_npz,
     )
@@ -813,6 +903,7 @@ def reexport_video(
     save_npz: bool,
     *,
     append_colormap: bool = False,
+    append_model: bool = False,
     export_stem: str | None = None,
     cancel_event: threading.Event,
     on_progress: Callable[[int, int], None],
@@ -845,6 +936,8 @@ def reexport_video(
         is_video=True,
         colormap=colormap,
         append_colormap=append_colormap,
+        model=state.model,
+        append_model=append_model,
         save_png16=save_png16,
         save_npz=save_npz,
     )
@@ -987,13 +1080,19 @@ def _fit_size(img_w: int, img_h: int, box_w: int, box_h: int) -> tuple[int, int]
 class DepthPro2App:
     """Native desktop GUI for running Depth Pro 2 on images, videos, and folders."""
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, settings_path: Path | None = None):
         """Initialize window layout, state variables, logging bridge, and background pollers."""
         self.root = root
         self.root.title("Depth Pro 2")
         self.root.geometry("1220x800")
         self.root.minsize(960, 720)
         self.root.configure(bg=PALETTE["bg"])
+
+        self._settings_path: Path = (
+            settings_path if settings_path is not None else default_settings_path()
+        )
+        self._save_after_id: str | None = None
+        self._loading_settings = False
 
         self._queue: queue.Queue[tuple[Any, ...]] = queue.Queue()
         self._cancel_event = threading.Event()
@@ -1041,6 +1140,7 @@ class DepthPro2App:
         self.max_res_var = tk.StringVar(value=VIDEO_RES_OPTIONS[0][1])
         self.colormap_var = tk.StringVar(value="turbo")
         self.append_colormap_var = tk.BooleanVar(value=False)
+        self.append_model_var = tk.BooleanVar(value=False)
         self.save_png16_var = tk.BooleanVar(value=False)
         self.save_npz_var = tk.BooleanVar(value=False)
         self.view_mode_var = tk.StringVar(value="side")
@@ -1052,6 +1152,12 @@ class DepthPro2App:
         self.near_label_var = tk.StringVar(value="near")
         self.status_left_var = tk.StringVar(value="Device: detecting...")
         self.status_right_var = tk.StringVar(value="Ready")
+
+        self._loading_settings = True
+        try:
+            restored_input = self._load_settings()
+        finally:
+            self._loading_settings = False
 
         self._configure_style()
         self._build_ui()
@@ -1065,9 +1171,198 @@ class DepthPro2App:
 
         self._sync_mode_state()
         self._update_button_states()
+        if restored_input is not None:
+            self._load_input_preview(restored_input)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_after_id = self.root.after(POLL_INTERVAL_MS, self._poll_queue)
         threading.Thread(target=self._probe_environment, daemon=True).start()
+
+    def _load_settings(self) -> Path | None:
+        """Load persisted GUI settings and apply valid entries; return existing input path."""
+        data = load_gui_settings(self._settings_path)
+        if not data:
+            return None
+
+        out_val = data.get("output_path")
+        if isinstance(out_val, str) and out_val.strip():
+            self.output_var.set(out_val.strip())
+
+        model_val = data.get("model")
+        if isinstance(model_val, str) and model_val in MODEL_KEY_TO_LABEL:
+            self.model_var.set(MODEL_KEY_TO_LABEL[model_val])
+
+        dev_val = data.get("device")
+        if isinstance(dev_val, str) and dev_val in DEVICE_CHOICES:
+            self.device_var.set(dev_val)
+
+        prec_val = data.get("precision")
+        if isinstance(prec_val, str) and prec_val in PRECISION_CHOICES:
+            self.precision_var.set(prec_val)
+
+        focal_val = data.get("focal_px")
+        if isinstance(focal_val, str):
+            stripped = focal_val.strip()
+            if stripped == "":
+                self.focal_var.set("")
+            else:
+                try:
+                    parsed = float(stripped)
+                    if math.isfinite(parsed) and parsed > 0.0:
+                        self.focal_var.set(stripped)
+                except ValueError:
+                    pass
+
+        mode_val = data.get("mode")
+        if isinstance(mode_val, str) and mode_val in VIDEO_MODE_CHOICES:
+            self.mode_var.set(mode_val)
+
+        win_val = data.get("window")
+        if isinstance(win_val, int) and not isinstance(win_val, bool):
+            if 1 <= win_val <= 64:
+                self.window_var.set(str(win_val))
+        elif isinstance(win_val, str) and win_val.strip().isdigit():
+            parsed_win = int(win_val.strip())
+            if 1 <= parsed_win <= 64:
+                self.window_var.set(str(parsed_win))
+
+        ov_val = data.get("overlap")
+        if isinstance(ov_val, int) and not isinstance(ov_val, bool):
+            if 0 <= ov_val <= 63:
+                self.overlap_var.set(str(ov_val))
+        elif isinstance(ov_val, str) and ov_val.strip().isdigit():
+            parsed_ov = int(ov_val.strip())
+            if 0 <= parsed_ov <= 63:
+                self.overlap_var.set(str(parsed_ov))
+
+        max_short_val = data.get("max_short_side")
+        if max_short_val is None or (
+            isinstance(max_short_val, int) and not isinstance(max_short_val, bool)
+        ):
+            if max_short_val in VIDEO_RES_PX_TO_LABEL:
+                self.max_res_var.set(VIDEO_RES_PX_TO_LABEL[max_short_val])
+
+        cmap_val = data.get("colormap")
+        if isinstance(cmap_val, str) and cmap_val in COLORMAP_CHOICES:
+            self.colormap_var.set(cmap_val)
+
+        for key, var in (
+            ("append_colormap", self.append_colormap_var),
+            ("append_model", self.append_model_var),
+            ("save_png16", self.save_png16_var),
+            ("save_npz", self.save_npz_var),
+        ):
+            flag_val = data.get(key)
+            if isinstance(flag_val, bool):
+                var.set(flag_val)
+
+        view_val = data.get("view_mode")
+        if isinstance(view_val, str) and view_val in VIEW_MODE_KEYS:
+            self.view_mode_var.set(view_val)
+
+        split_val = data.get("split_ratio")
+        if (
+            isinstance(split_val, (int, float))
+            and not isinstance(split_val, bool)
+            and math.isfinite(split_val)
+        ):
+            self._split_ratio = min(0.98, max(0.02, float(split_val)))
+
+        win_size = data.get("window_size")
+        if isinstance(win_size, (list, tuple)) and len(win_size) == 2:
+            raw_w, raw_h = win_size
+            if (
+                isinstance(raw_w, int)
+                and not isinstance(raw_w, bool)
+                and isinstance(raw_h, int)
+                and not isinstance(raw_h, bool)
+            ):
+                max_w = max(960, self.root.winfo_screenwidth() - 40)
+                max_h = max(720, self.root.winfo_screenheight() - 80)
+                clamped_w = min(max(960, raw_w), max_w)
+                clamped_h = min(max(720, raw_h), max_h)
+                self.root.geometry(f"{clamped_w}x{clamped_h}")
+
+        in_val = data.get("input_path")
+        if isinstance(in_val, str) and in_val.strip():
+            candidate = Path(in_val.strip())
+            if candidate.exists():
+                self.input_var.set(in_val.strip())
+                return candidate
+        return None
+
+    def _collect_settings_dict(self) -> dict[str, Any]:
+        """Collect all current GUI options into a JSON-serializable dictionary."""
+        focal_text = self.focal_var.get().strip()
+        focal_to_save = ""
+        if focal_text:
+            try:
+                parsed_f = float(focal_text)
+                if math.isfinite(parsed_f) and parsed_f > 0.0:
+                    focal_to_save = focal_text
+            except ValueError:
+                focal_to_save = ""
+
+        try:
+            win_val = int(self.window_var.get().strip())
+        except ValueError:
+            win_val = 16
+        if not (1 <= win_val <= 64):
+            win_val = 16
+
+        try:
+            ov_val = int(self.overlap_var.get().strip())
+        except ValueError:
+            ov_val = 4
+        if not (0 <= ov_val <= 63):
+            ov_val = 4
+
+        settings: dict[str, Any] = {
+            "input_path": self.input_var.get().strip(),
+            "output_path": self.output_var.get().strip(),
+            "model": MODEL_LABEL_TO_KEY.get(self.model_var.get(), DEFAULT_MODEL_KEY),
+            "device": self.device_var.get(),
+            "precision": self.precision_var.get(),
+            "focal_px": focal_to_save,
+            "mode": self.mode_var.get(),
+            "window": win_val,
+            "overlap": ov_val,
+            "max_short_side": VIDEO_RES_LABEL_TO_PX.get(self.max_res_var.get()),
+            "colormap": self.colormap_var.get(),
+            "append_colormap": bool(self.append_colormap_var.get()),
+            "append_model": bool(self.append_model_var.get()),
+            "save_png16": bool(self.save_png16_var.get()),
+            "save_npz": bool(self.save_npz_var.get()),
+            "view_mode": self.view_mode_var.get(),
+            "split_ratio": round(float(self._split_ratio), 4),
+        }
+        try:
+            if self.root.winfo_exists() and self.root.state() == "normal":
+                w = self.root.winfo_width()
+                h = self.root.winfo_height()
+                if w >= 960 and h >= 720:
+                    settings["window_size"] = [w, h]
+        except Exception:
+            pass
+        return settings
+
+    def _schedule_save_settings(self) -> None:
+        if self._loading_settings or not self.root.winfo_exists():
+            return
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+        self._save_after_id = self.root.after(SETTINGS_SAVE_DEBOUNCE_MS, self._save_settings)
+
+    def _save_settings(self) -> None:
+        if self._save_after_id is not None:
+            try:
+                self.root.after_cancel(self._save_after_id)
+            except Exception:
+                pass
+            self._save_after_id = None
+        save_gui_settings(self._settings_path, self._collect_settings_dict())
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -1431,30 +1726,41 @@ class DepthPro2App:
         self._add_tooltip(cmap_lbl, "colormap")
         self._add_tooltip(self.colormap_combo, "colormap")
 
+        opts_grid = ttk.Frame(disp_frame, style="Panel.TFrame")
+        opts_grid.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        opts_grid.columnconfigure(0, weight=1, uniform="disp_opt")
+        opts_grid.columnconfigure(1, weight=1, uniform="disp_opt")
+
         append_cmap_chk = ttk.Checkbutton(
-            disp_frame,
-            text="Append colormap to filename",
+            opts_grid,
+            text="Append colormap",
             variable=self.append_colormap_var,
         )
-        append_cmap_chk.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        append_cmap_chk.grid(row=0, column=0, sticky="w")
         self._add_tooltip(append_cmap_chk, "append_colormap")
 
-        save_row = ttk.Frame(disp_frame, style="Panel.TFrame")
-        save_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(1, 0))
+        append_model_chk = ttk.Checkbutton(
+            opts_grid,
+            text="Append model",
+            variable=self.append_model_var,
+        )
+        append_model_chk.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self._add_tooltip(append_model_chk, "append_model")
+
         png16_chk = ttk.Checkbutton(
-            save_row,
+            opts_grid,
             text="Save 16-bit PNG",
             variable=self.save_png16_var,
         )
-        png16_chk.pack(side="left", padx=(0, 10))
+        png16_chk.grid(row=1, column=0, sticky="w", pady=(1, 0))
         self._add_tooltip(png16_chk, "save_png16")
 
         npz_chk = ttk.Checkbutton(
-            save_row,
+            opts_grid,
             text="Save metric .npz",
             variable=self.save_npz_var,
         )
-        npz_chk.pack(side="left")
+        npz_chk.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(1, 0))
         self._add_tooltip(npz_chk, "save_npz")
 
         self.reexport_btn = ttk.Button(
@@ -1463,7 +1769,7 @@ class DepthPro2App:
             style="Secondary.TButton",
             command=self._start_reexport,
         )
-        self.reexport_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        self.reexport_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
         self._add_tooltip(self.reexport_btn, "reexport")
 
         # 5. Actions & Progress
@@ -1603,6 +1909,25 @@ class DepthPro2App:
     def _bind_events(self) -> None:
         self.mode_var.trace_add("write", lambda *_: self._sync_mode_state())
         self.colormap_var.trace_add("write", lambda *_: self._on_colormap_changed())
+        for var in (
+            self.input_var,
+            self.output_var,
+            self.model_var,
+            self.device_var,
+            self.precision_var,
+            self.focal_var,
+            self.mode_var,
+            self.window_var,
+            self.overlap_var,
+            self.max_res_var,
+            self.colormap_var,
+            self.append_colormap_var,
+            self.append_model_var,
+            self.save_png16_var,
+            self.save_npz_var,
+            self.view_mode_var,
+        ):
+            var.trace_add("write", lambda *_: self._schedule_save_settings())
         self.input_entry.bind("<Return>", lambda _e: self._on_input_entered())
 
         self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -1872,6 +2197,7 @@ class DepthPro2App:
             save_npz=self.save_npz_var.get(),
             max_short_side=max_short_side,
             append_colormap=self.append_colormap_var.get(),
+            append_model=self.append_model_var.get(),
         )
 
     def _collect_conflict_check_inputs(self, input_path: Path, output_path: Path) -> list[Path]:
@@ -2054,6 +2380,7 @@ class DepthPro2App:
         config = self._build_run_config(show_errors=True)
         if config is None:
             return
+        self._save_settings()
 
         check_paths = self._collect_conflict_check_inputs(config.input_path, config.output_path)
         existing_all: list[Path] = []
@@ -2065,6 +2392,8 @@ class DepthPro2App:
                 is_video=is_vid,
                 colormap=config.colormap,
                 append_colormap=config.append_colormap,
+                model=config.model,
+                append_model=config.append_model,
                 save_png16=config.save_png16,
                 save_npz=config.save_npz,
             )
@@ -2091,6 +2420,8 @@ class DepthPro2App:
                     is_video=is_vid,
                     colormap=config.colormap,
                     append_colormap=config.append_colormap,
+                    model=config.model,
+                    append_model=config.append_model,
                     save_png16=config.save_png16,
                     save_npz=config.save_npz,
                 )
@@ -2101,6 +2432,8 @@ class DepthPro2App:
                     is_video=is_vid,
                     colormap=config.colormap,
                     append_colormap=config.append_colormap,
+                    model=config.model,
+                    append_model=config.append_model,
                     save_png16=config.save_png16,
                     save_npz=config.save_npz,
                 ).color_path.name
@@ -2112,6 +2445,8 @@ class DepthPro2App:
                         is_video=is_vid,
                         colormap=config.colormap,
                         append_colormap=config.append_colormap,
+                        model=config.model,
+                        append_model=config.append_model,
                         save_png16=config.save_png16,
                         save_npz=config.save_npz,
                     ).color_path.name
@@ -2123,6 +2458,8 @@ class DepthPro2App:
                         is_video=is_vid,
                         colormap=config.colormap,
                         append_colormap=config.append_colormap,
+                        model=config.model,
+                        append_model=config.append_model,
                         save_png16=config.save_png16,
                         save_npz=config.save_npz,
                     )
@@ -2174,8 +2511,10 @@ class DepthPro2App:
         state = self._export_state
         colormap = self.colormap_var.get()
         append_colormap = self.append_colormap_var.get()
+        append_model = self.append_model_var.get()
         save_png16 = self.save_png16_var.get()
         save_npz = self.save_npz_var.get()
+        self._save_settings()
         is_video = state.kind == "video"
         ignore_paths = {state.npz_dir} if (is_video and state.npz_dir is not None) else set()
 
@@ -2185,6 +2524,8 @@ class DepthPro2App:
             is_video=is_video,
             colormap=colormap,
             append_colormap=append_colormap,
+            model=state.model,
+            append_model=append_model,
             save_png16=save_png16,
             save_npz=save_npz,
         )
@@ -2197,6 +2538,8 @@ class DepthPro2App:
                 is_video=is_video,
                 colormap=colormap,
                 append_colormap=append_colormap,
+                model=state.model,
+                append_model=append_model,
                 save_png16=save_png16,
                 save_npz=save_npz,
                 ignore_paths=ignore_paths,
@@ -2208,6 +2551,8 @@ class DepthPro2App:
                 is_video=is_video,
                 colormap=colormap,
                 append_colormap=append_colormap,
+                model=state.model,
+                append_model=append_model,
                 save_png16=save_png16,
                 save_npz=save_npz,
             ).color_path.name
@@ -2219,6 +2564,8 @@ class DepthPro2App:
                     is_video=is_video,
                     colormap=colormap,
                     append_colormap=append_colormap,
+                    model=state.model,
+                    append_model=append_model,
                     save_png16=save_png16,
                     save_npz=save_npz,
                 ).color_path.name
@@ -2230,6 +2577,8 @@ class DepthPro2App:
                     is_video=is_video,
                     colormap=colormap,
                     append_colormap=append_colormap,
+                    model=state.model,
+                    append_model=append_model,
                     save_png16=save_png16,
                     save_npz=save_npz,
                 )
@@ -2255,6 +2604,8 @@ class DepthPro2App:
                     is_video=is_video,
                     colormap=colormap,
                     append_colormap=append_colormap,
+                    model=state.model,
+                    append_model=append_model,
                     save_png16=save_png16,
                     save_npz=save_npz,
                     base_suffix=format_timestamp_suffix(),
@@ -2274,7 +2625,16 @@ class DepthPro2App:
 
         self._worker_thread = threading.Thread(
             target=self._reexport_worker,
-            args=(state, output_dir, colormap, append_colormap, save_png16, save_npz, export_stem),
+            args=(
+                state,
+                output_dir,
+                colormap,
+                append_colormap,
+                append_model,
+                save_png16,
+                save_npz,
+                export_stem,
+            ),
             daemon=True,
         )
         self._worker_thread.start()
@@ -2285,6 +2645,7 @@ class DepthPro2App:
         output_dir: Path,
         colormap: str,
         append_colormap: bool,
+        append_model: bool,
         save_png16: bool,
         save_npz: bool,
         export_stem: str,
@@ -2294,7 +2655,9 @@ class DepthPro2App:
             self._queue.put(("log", msg))
 
         try:
-            emit_log(f"Re-exporting {export_stem} with colormap={colormap}...")
+            emit_log(
+                f"Re-exporting {export_stem} (model={state.model}, colormap={colormap})..."
+            )
             if state.kind == "image":
                 out_path, lines, colored = reexport_image(
                     state,
@@ -2303,6 +2666,7 @@ class DepthPro2App:
                     save_png16,
                     save_npz,
                     append_colormap=append_colormap,
+                    append_model=append_model,
                     export_stem=export_stem,
                 )
                 for line in lines:
@@ -2342,6 +2706,7 @@ class DepthPro2App:
                 save_png16,
                 save_npz,
                 append_colormap=append_colormap,
+                append_model=append_model,
                 export_stem=export_stem,
                 cancel_event=self._cancel_event,
                 on_progress=on_progress,
@@ -2479,6 +2844,8 @@ class DepthPro2App:
                         is_video=is_video,
                         colormap=config.colormap,
                         append_colormap=config.append_colormap,
+                        model=config.model,
+                        append_model=config.append_model,
                         save_png16=config.save_png16,
                         save_npz=config.save_npz,
                     )
@@ -2490,6 +2857,8 @@ class DepthPro2App:
                                 is_video=is_video,
                                 colormap=config.colormap,
                                 append_colormap=config.append_colormap,
+                                model=config.model,
+                                append_model=config.append_model,
                                 save_png16=config.save_png16,
                                 save_npz=config.save_npz,
                             )
@@ -2500,6 +2869,8 @@ class DepthPro2App:
                                 is_video=is_video,
                                 colormap=config.colormap,
                                 append_colormap=config.append_colormap,
+                                model=config.model,
+                                append_model=config.append_model,
                                 save_png16=config.save_png16,
                                 save_npz=config.save_npz,
                                 base_suffix=run_timestamp,
@@ -2515,6 +2886,8 @@ class DepthPro2App:
                     is_video=is_video,
                     colormap=config.colormap,
                     append_colormap=config.append_colormap,
+                    model=config.model,
+                    append_model=config.append_model,
                     save_png16=config.save_png16,
                     save_npz=config.save_npz,
                 )
@@ -2585,6 +2958,7 @@ class DepthPro2App:
                                 p05=p05,
                                 p95=p95,
                                 inf_pct=inf_pct,
+                                model=config.model,
                                 inverse_depth=inverse_depth,
                             ),
                         )
@@ -2911,6 +3285,7 @@ class DepthPro2App:
                             p05=p05,
                             p95=p95,
                             inf_pct=inf_pct,
+                            model=config.model,
                             frame_shape=inverse_depth.shape[:2],
                             frame_count=count,
                             fps=fps,
@@ -3330,6 +3705,7 @@ class DepthPro2App:
         if rw <= 0:
             return
         self._split_ratio = min(0.98, max(0.02, (event.x - x0) / rw))
+        self._schedule_save_settings()
         self._redraw_canvas()
 
     def _on_canvas_motion(self, event: tk.Event[Any]) -> None:
@@ -3463,6 +3839,7 @@ class DepthPro2App:
         ).pack(side="right")
 
     def _on_close(self) -> None:
+        self._save_settings()
         self._cancel_event.set()
         self._set_export_state(None)
         _cleanup_all_temp_dirs()
