@@ -10,6 +10,10 @@ uv run depth-pro-2 gui
 
 **See [GUI.md](GUI.md) for the full parameter guide, example 16 GB GPU video presets, and Windows CUDA setup notes.**
 
+<p align="center">
+  <img src="assets/gui-screenshot.png" alt="Depth Pro 2 Desktop GUI" width="900">
+</p>
+
 <h1 align="center">Depth Pro 2: Sharp and Temporally Consistent Metric Monocular Depth</h1>
 
 <p align="center">

@@ -12,6 +12,10 @@ This fork adds a native desktop GUI built with Python's built-in `tkinter` / `tt
 - **Model Caching & Memory Control**: Keeps the loaded model cached across runs for fast iteration, with **Unload Model** to free VRAM/RAM and **Cancel** to stop long video jobs cleanly.
 - **Built-in Parameter Help**: Hover over any setting for a tooltip or click **? Help** in the toolbar to open the in-app Parameter Guide.
 
+<p align="center">
+  <img src="assets/gui-screenshot.png" alt="Depth Pro 2 Desktop GUI" width="900">
+</p>
+
 ## Quick Start
 
 ```bash
